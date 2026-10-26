@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"sync"
@@ -48,6 +49,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtimeschema "k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -191,10 +193,11 @@ func NewController(
 	_, _ = gsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: c.enqueueGameServerBasedOnState,
 		UpdateFunc: func(oldObj, newObj any) {
-			// no point in processing unless there is a State change
 			oldGs := oldObj.(*agonesv1.GameServer)
 			newGs := newObj.(*agonesv1.GameServer)
-			if oldGs.Status.State != newGs.Status.State || !newGs.ObjectMeta.DeletionTimestamp.IsZero() {
+			annotationsChanged := runtime.FeatureEnabled(runtime.FeatureGameServerPodAnnotationSync) &&
+				!maps.Equal(oldGs.Annotations, newGs.Annotations)
+			if oldGs.Status.State != newGs.Status.State || !newGs.ObjectMeta.DeletionTimestamp.IsZero() || annotationsChanged {
 				c.enqueueGameServerBasedOnState(newGs)
 			}
 		},
@@ -522,7 +525,58 @@ func (c *Controller) syncGameServer(ctx context.Context, key string) error {
 		return err
 	}
 
-	return nil
+	return c.syncGameServerPodAnnotations(ctx, gs)
+}
+
+// syncGameServerPodAnnotations copies additions and updates without removing Pod-owned annotations.
+func (c *Controller) syncGameServerPodAnnotations(ctx context.Context, gs *agonesv1.GameServer) error {
+	if !runtime.FeatureEnabled(runtime.FeatureGameServerPodAnnotationSync) ||
+		!gs.DeletionTimestamp.IsZero() || gs.Status.State == agonesv1.GameServerStateShutdown {
+		return nil
+	}
+	if _, isDev := gs.GetDevAddress(); isDev {
+		return nil
+	}
+
+	pod, err := c.gameServerPod(gs)
+	if k8serrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !pod.DeletionTimestamp.IsZero() {
+		return nil
+	}
+
+	annotations := map[string]string{}
+	for key, value := range gs.Annotations {
+		// These annotations have separate owners or lifecycle semantics on the Pod.
+		switch key {
+		case agonesv1.GameServerContainerAnnotation, agonesv1.VersionAnnotation,
+			agonesv1.GameServerReadyContainerIDAnnotation, agonesv1.PassthroughPortAssignmentAnnotation,
+			agonesv1.PodSafeToEvictAnnotation, agonesv1.DevAddressAnnotation, agonesv1.GameServerErroredAtAnnotation,
+			"autopilot.gke.io/host-port-assignment", "autopilot.gke.io/primary-container",
+			corev1.LastAppliedConfigAnnotation:
+			continue
+		}
+		if current, exists := pod.Annotations[key]; !exists || current != value {
+			annotations[key] = value
+		}
+	}
+	if len(annotations) == 0 {
+		return nil
+	}
+
+	patch, err := json.Marshal(map[string]any{"metadata": map[string]any{"annotations": annotations}})
+	if err != nil {
+		return c.errs.Wrap(err, "error encoding Pod annotation patch")
+	}
+	_, err = c.podGetter.Pods(pod.Namespace).Patch(ctx, pod.Name, types.MergePatchType, patch, metav1.PatchOptions{})
+	if k8serrors.IsNotFound(err) {
+		return nil
+	}
+	return c.errs.Wrapf(err, "error patching annotations on Pod %s", pod.Name)
 }
 
 // syncGameServerDeletionTimestamp if the deletion timestamp is non-zero

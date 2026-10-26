@@ -45,9 +45,11 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apimachinery/pkg/watch"
+	kubefake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/utils/ptr"
@@ -155,6 +157,151 @@ func TestControllerSyncGameServer(t *testing.T) {
 			Spec:   newSingleContainerSpec(),
 			Status: agonesv1.GameServerStatus{State: agonesv1.GameServerStateReady}})
 	})
+}
+
+func TestControllerSyncGameServerPodAnnotations(t *testing.T) {
+	agruntime.FeatureTestMutex.Lock()
+	defer agruntime.FeatureTestMutex.Unlock()
+	originalFeatures := agruntime.EncodeFeatures()
+	defer func() { require.NoError(t, agruntime.ParseFeatures(originalFeatures)) }()
+
+	for _, tc := range []struct {
+		name           string
+		annotations    map[string]string
+		podAnnotations map[string]string
+		want           map[string]string
+	}{
+		{
+			name:           "add and update annotations while preserving Pod-only values",
+			annotations:    map[string]string{"session-id": "new", "agones.dev/sdk-room": "room", "empty": "", "unchanged": "same"},
+			podAnnotations: map[string]string{"session-id": "old", "unchanged": "same", "pod-only": "keep", "removed-from-gameserver": "keep"},
+			want:           map[string]string{"session-id": "new", "agones.dev/sdk-room": "room", "empty": ""},
+		},
+		{
+			name:           "equal annotations do not write",
+			annotations:    map[string]string{"session-id": "same", "empty": ""},
+			podAnnotations: map[string]string{"session-id": "same", "empty": ""},
+		},
+		{
+			name:        "nil Pod annotations",
+			annotations: map[string]string{"session-id": "new"},
+			want:        map[string]string{"session-id": "new"},
+		},
+		{
+			name:           "nil GameServer annotations preserve Pod annotations",
+			podAnnotations: map[string]string{"pod-only": "keep"},
+		},
+		{
+			name: "protected annotations",
+			annotations: map[string]string{
+				agonesv1.GameServerContainerAnnotation:        "ignored",
+				agonesv1.VersionAnnotation:                    "ignored",
+				agonesv1.GameServerReadyContainerIDAnnotation: "ignored",
+				agonesv1.PassthroughPortAssignmentAnnotation:  "ignored",
+				agonesv1.PodSafeToEvictAnnotation:             "ignored",
+				agonesv1.GameServerErroredAtAnnotation:        "ignored",
+				"autopilot.gke.io/host-port-assignment":       "ignored",
+				"autopilot.gke.io/primary-container":          "ignored",
+				corev1.LastAppliedConfigAnnotation:            "ignored",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, agruntime.ParseFeatures("GameServerPodAnnotationSync=true"))
+			c, m := newFakeController()
+			gs := &agonesv1.GameServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "gameserver", Annotations: tc.annotations},
+				Status:     agonesv1.GameServerStatus{State: agonesv1.GameServerStateAllocated},
+			}
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Name: gs.Name, Namespace: gs.Namespace, Annotations: tc.podAnnotations,
+				OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(gs, agonesv1.SchemeGroupVersion.WithKind("GameServer"))},
+			}}
+			require.NoError(t, m.AgonesInformerFactory.Agones().V1().GameServers().Informer().GetStore().Add(gs))
+			podStore := m.KubeInformerFactory.Core().V1().Pods().Informer().GetStore()
+			require.NoError(t, podStore.Add(pod))
+			m.KubeClient = kubefake.NewClientset(pod.DeepCopy())
+			c.podGetter = m.KubeClient.CoreV1()
+			originalPod := pod.DeepCopy()
+			originalGS := gs.DeepCopy()
+
+			require.NoError(t, c.syncGameServer(t.Context(), "default/test"))
+			actions := m.KubeClient.Actions()
+			if tc.want == nil {
+				assert.Empty(t, actions)
+			} else {
+				require.Len(t, actions, 1)
+				patch := actions[0].(k8stesting.PatchAction)
+				assert.Equal(t, types.MergePatchType, patch.GetPatchType())
+				var body map[string]map[string]map[string]string
+				require.NoError(t, json.Unmarshal(patch.GetPatch(), &body))
+				assert.Equal(t, map[string]map[string]map[string]string{"metadata": {"annotations": tc.want}}, body)
+				updated, err := m.KubeClient.CoreV1().Pods(gs.Namespace).Get(t.Context(), gs.Name, metav1.GetOptions{})
+				require.NoError(t, err)
+				expected := map[string]string{}
+				maps.Copy(expected, tc.podAnnotations)
+				maps.Copy(expected, tc.want)
+				assert.Equal(t, expected, updated.Annotations)
+				require.NoError(t, podStore.Update(updated))
+				m.KubeClient.ClearActions()
+				require.NoError(t, c.syncGameServer(t.Context(), "default/test"))
+				assert.Empty(t, m.KubeClient.Actions(), "a reconciled Pod should not be patched again")
+			}
+			assert.Equal(t, originalPod, pod, "must not mutate the informer cache")
+			assert.Equal(t, originalGS, gs)
+		})
+	}
+
+	for _, scenario := range []string{"disabled", "development", "deleting GameServer", "shutdown", "missing Pod", "unowned Pod", "deleting Pod", "patch failure", "Pod disappeared"} {
+		t.Run(scenario, func(t *testing.T) {
+			require.NoError(t, agruntime.ParseFeatures("GameServerPodAnnotationSync=true"))
+			c, m := newFakeController()
+			gs := &agonesv1.GameServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default", UID: "gameserver", Annotations: map[string]string{"session-id": "new"}},
+				Status:     agonesv1.GameServerStatus{State: agonesv1.GameServerStateAllocated},
+			}
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Name: gs.Name, Namespace: gs.Namespace,
+				OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(gs, agonesv1.SchemeGroupVersion.WithKind("GameServer"))},
+			}}
+			now := metav1.Now()
+			switch scenario {
+			case "disabled":
+				require.NoError(t, agruntime.ParseFeatures("GameServerPodAnnotationSync=false"))
+			case "development":
+				gs.Annotations[agonesv1.DevAddressAnnotation] = ipFixture
+			case "deleting GameServer":
+				gs.DeletionTimestamp = &now
+			case "shutdown":
+				gs.Status.State = agonesv1.GameServerStateShutdown
+			case "unowned Pod":
+				pod.OwnerReferences[0].UID = "another-gameserver"
+			case "deleting Pod":
+				pod.DeletionTimestamp = &now
+			}
+			if scenario != "missing Pod" {
+				require.NoError(t, m.KubeInformerFactory.Core().V1().Pods().Informer().GetStore().Add(pod))
+			}
+			patchError := errors.New("patch failed")
+			m.KubeClient.AddReactor("patch", "pods", func(_ k8stesting.Action) (bool, runtime.Object, error) {
+				if scenario == "Pod disappeared" {
+					return true, nil, k8serrors.NewNotFound(corev1.Resource("pods"), pod.Name)
+				}
+				return true, nil, patchError
+			})
+			err := c.syncGameServerPodAnnotations(t.Context(), gs)
+			if scenario == "patch failure" {
+				assert.ErrorIs(t, err, patchError)
+			} else {
+				require.NoError(t, err)
+			}
+			if scenario == "patch failure" || scenario == "Pod disappeared" {
+				assert.Len(t, m.KubeClient.Actions(), 1)
+			} else {
+				assert.Empty(t, m.KubeClient.Actions())
+			}
+		})
+	}
 }
 
 func TestControllerSyncGameServerWithInitSidecar(t *testing.T) {
@@ -417,6 +564,12 @@ func TestControllerSyncGameServerWithDevIP(t *testing.T) {
 }
 
 func TestControllerWatchGameServers(t *testing.T) {
+	agruntime.FeatureTestMutex.Lock()
+	defer agruntime.FeatureTestMutex.Unlock()
+	originalFeatures := agruntime.EncodeFeatures()
+	defer func() { require.NoError(t, agruntime.ParseFeatures(originalFeatures)) }()
+	require.NoError(t, agruntime.ParseFeatures("GameServerPodAnnotationSync=false"))
+
 	c, m := newFakeController()
 	fixture := agonesv1.GameServer{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"}, Spec: newSingleContainerSpec()}
 	fixture.ApplyDefaults()
@@ -489,6 +642,32 @@ func TestControllerWatchGameServers(t *testing.T) {
 	noStateChange(gsSynced)
 
 	copyFixture := fixture.DeepCopy()
+	copyFixture.Annotations["session-id"] = "first"
+	gsWatch.Modify(copyFixture)
+	select {
+	case <-received:
+		t.Fatal("annotation changes should not enqueue when the feature is disabled")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	require.NoError(t, agruntime.ParseFeatures("GameServerPodAnnotationSync=true"))
+	copyFixture = copyFixture.DeepCopy()
+	copyFixture.Annotations["session-id"] = "second"
+	gsWatch.Modify(copyFixture)
+	select {
+	case key := <-received:
+		assert.Equal(t, "default/test", key)
+	case <-time.After(5 * time.Second):
+		t.Fatal("annotation changes should enqueue without a state change")
+	}
+	gsWatch.Modify(copyFixture.DeepCopy())
+	select {
+	case <-received:
+		t.Fatal("unchanged annotations should not enqueue")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	copyFixture = copyFixture.DeepCopy()
 	copyFixture.Status.State = agonesv1.GameServerStateStarting
 	logrus.Info("modify copyFixture")
 	gsWatch.Modify(copyFixture)

@@ -82,6 +82,9 @@ const (
 	////////////////
 	// Dev features
 
+	// FeatureGameServerPodAnnotationSync enables copying GameServer annotations to its Pod.
+	FeatureGameServerPodAnnotationSync Feature = "GameServerPodAnnotationSync"
+
 	// FeatureProcessorAllocator is a feature flag to enable/disable the processor allocator feature.
 	FeatureProcessorAllocator = "ProcessorAllocator"
 
@@ -169,7 +172,8 @@ var (
 		FeatureWasmAutoscaler:         false,
 
 		// Dev features
-		FeatureProcessorAllocator: false,
+		FeatureGameServerPodAnnotationSync: false,
+		FeatureProcessorAllocator:          false,
 
 		// Example feature
 		FeatureExample: false,

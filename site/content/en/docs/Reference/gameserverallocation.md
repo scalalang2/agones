@@ -184,6 +184,12 @@ The `spec` field is the actual `GameServerAllocation` specification, and it is c
   cluster. See [Scheduling and Autoscaling]({{< ref "/docs/Advanced/scheduling-and-autoscaling.md" >}}) for more details.
 - `metadata` is an optional list of custom labels and/or annotations that will be used to patch
   the game server's metadata in the moment of allocation. This can be used to tell the server necessary session data
+  - The experimental, disabled-by-default `GameServerPodAnnotationSync` development feature gate also copies
+    GameServer annotation additions and updates to its Pod. This includes allocation annotations, SDK `SetAnnotation`
+    updates, and manual GameServer annotation changes. Propagation is asynchronous: allocation may return before the
+    Pod is updated. Labels are not copied, and removing a GameServer annotation does not remove its Pod copy.
+    Pod-only annotations are preserved. Agones lifecycle annotations, eviction settings, GKE Autopilot host-port and
+    primary-container annotations, and `kubectl.kubernetes.io/last-applied-configuration` are excluded.
 - `priorities` (Beta, requires `CountsAndLists` feature flag) alters the priority by which game `GameServers` are allocated by available capacity.
 - `counters` (Beta, "CountsAndLists" feature flag) Counter actions to perform during allocation.
 - `lists` (Beta, "CountsAndLists" feature flag) List actions to perform during allocation.

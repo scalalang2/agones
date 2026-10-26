@@ -37,6 +37,7 @@ PlayerTracking: false
 WasmAutoscaler: false
 
 # Dev features
+GameServerPodAnnotationSync: false
 ProcessorAllocator: false
 
 # Example feature
